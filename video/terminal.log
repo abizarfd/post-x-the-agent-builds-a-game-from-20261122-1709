@@ -1,0 +1,14 @@
+$ node --check <(extract game script)
+extracted 319 lines
+syntax OK — game script parses clean
+$ ls -la repo/
+total 12
+drwxrws--- 1 root nogroup    20 Nov 22 18:58 .
+drwxrws--- 1 root nogroup   232 Nov 22 18:59 ..
+-rw-rw---- 1 root nogroup 11786 Nov 22 19:00 index.html
+$ node video/run-game.mjs
+game: loaded index.html (320 lines of game code)
+game: canvas 1280x720, round 60s, 3 lives
+game: simulated 300 frames (10s at 30fps)
+game: final score 60 — caught 6 stars, missed 2, lives left 1
+game: wrote 300 frames to video/frames/game-frames.json

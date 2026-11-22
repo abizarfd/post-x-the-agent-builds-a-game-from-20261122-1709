@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ghost Catcher — one prompt, one game</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #14101d; height: 100%; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { max-width: 100vw; max-height: 100vh; display: block;
+           background: #14101d; cursor: none; }
+  #hint { position: fixed; bottom: 10px; width: 100%; text-align: center;
+          color: #8a84a3; font: 14px monospace; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="game" width="1280" height="720"></canvas>
+<div id="hint">← → or mouse to move the ghost &middot; catch stars, don't let them fall &middot; R to restart</div>
+<script>
+"use strict";
+// Ghost Catcher — a tiny browser game built from one prompt.
+// One file, no libraries. Move the ghost, catch falling stars.
+//
+// Rules: a star caught is +10 points. A star that hits the floor costs
+// one of 3 lives. 60 seconds on the clock. Highest score wins.
+(function () {
+  var W = 1280, H = 720;
+  var GHOST_Y = H - 130;      // ghost's vertical home
+  var GHOST_HALF = 58;        // catch half-width
+  var GHOST_SPEED = 620;      // px per second
+  var ROUND_SECONDS = 60;
+  var MAX_LIVES = 3;
+
+  // --- tiny deterministic RNG (mulberry32) so a headless run can replay ---
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var rand = mulberry32(20261122);
+
+  // --- state ---------------------------------------------------------------
+  var state;
+  function freshState() {
+    return {
+      ghostX: W / 2, dir: 0, pointerX: null,
+      stars: [], particles: [], popups: [],
+      score: 0, lives: MAX_LIVES, timeLeft: ROUND_SECONDS,
+      elapsed: 0, spawnIn: 0.4, over: false, won: false,
+      caught: 0, missed: 0,
+    };
+  }
+  state = freshState();
+
+  // Pre-computed background starfield (fixed dots, twinkle by radius).
+  var dots = [];
+  for (var i = 0; i < 90; i++) {
+    dots.push({ x: rand() * W, y: rand() * (H - 160),
+                r: 1 + rand() * 1.8, ph: rand() * 6.28, sp: 0.6 + rand() * 1.4 });
+  }
+
+  // --- spawning ------------------------------------------------------------
+  function spawnStar() {
+    var speed = 140 + state.elapsed * 2.0;   // the fall gets faster
+    state.stars.push({
+      x: 40 + rand() * (W - 80),
+      y: -20,
+      vy: speed + rand() * 60,
+      sway: rand() * 6.28,
+      swayAmp: 12 + rand() * 26,
+      r: 13 + rand() * 7,
+      rot: rand() * 6.28,
+      spin: (rand() - 0.5) * 1.6,
+    });
+  }
+
+  // --- update --------------------------------------------------------------
+  function update(dt) {
+    if (state.over) return;
+    state.elapsed += dt;
+    state.timeLeft = Math.max(0, ROUND_SECONDS - state.elapsed);
+    if (state.timeLeft <= 0) { endGame(true); return; }
+
+    // Ghost movement: keyboard dir wins, else glide to pointer.
+    if (state.dir !== 0) {
+      state.ghostX += state.dir * GHOST_SPEED * dt;
+    } else if (state.pointerX !== null) {
+      var dx = state.pointerX - state.ghostX;
+      var step = GHOST_SPEED * dt;
+      state.ghostX += Math.max(-step, Math.min(step, dx));
+    }
+    state.ghostX = Math.max(GHOST_HALF, Math.min(W - GHOST_HALF, state.ghostX));
+
+    // Spawn a new star on a timer that tightens as the round goes on.
+    state.spawnIn -= dt;
+    if (state.spawnIn <= 0) {
+      spawnStar();
+      state.spawnIn = Math.max(0.6, 0.9 - state.elapsed * 0.004);
+    }
+
+    // Move stars, catch or drop them.
+    for (var i = state.stars.length - 1; i >= 0; i--) {
+      var s = state.stars[i];
+      s.y += s.vy * dt;
+      s.rot += s.spin * dt;
+      s.x += Math.sin(state.elapsed * 2 + s.sway) * s.swayAmp * dt;
+      if (s.y >= GHOST_Y - 10 && s.y <= GHOST_Y + 46 &&
+          Math.abs(s.x - state.ghostX) < GHOST_HALF + s.r) {
+        // Caught!
+        state.score += 10;
+        state.caught++;
+        burst(s.x, s.y);
+        state.popups.push({ x: s.x, y: s.y - 10, text: "+10", age: 0 });
+        state.stars.splice(i, 1);
+      } else if (s.y > H + 24) {
+        state.lives--;
+        state.missed++;
+        state.stars.splice(i, 1);
+        if (state.lives <= 0) { endGame(false); return; }
+      }
+    }
+
+    // Particles shrink away; popups float up.
+    for (var p = state.particles.length - 1; p >= 0; p--) {
+      var pt = state.particles[p];
+      pt.age += dt;
+      pt.x += pt.vx * dt; pt.y += pt.vy * dt;
+      if (pt.age > 0.35) state.particles.splice(p, 1);
+    }
+    for (var q = state.popups.length - 1; q >= 0; q--) {
+      var pp = state.popups[q];
+      pp.age += dt; pp.y -= 42 * dt;
+      if (pp.age > 0.7) state.popups.splice(q, 1);
+    }
+  }
+
+  function burst(x, y) {
+    for (var k = 0; k < 8; k++) {
+      var a = (k / 8) * 6.283;
+      state.particles.push({ x: x, y: y,
+        vx: Math.cos(a) * 90, vy: Math.sin(a) * 90, age: 0, r: 5 });
+    }
+  }
+
+  function endGame(timeUp) {
+    state.over = true;
+    state.won = timeUp;
+  }
+
+  // --- drawing (primitives only: fillRect, arcs, paths, fillText) ---------
+  function starPath(ctx, x, y, r, rot) {
+    ctx.beginPath();
+    for (var k = 0; k < 10; k++) {
+      var rr = (k % 2 === 0) ? r : r * 0.45;
+      var a = rot + (k / 10) * 6.283 - 1.5708;
+      var px = x + Math.cos(a) * rr, py = y + Math.sin(a) * rr;
+      if (k === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+  }
+
+  function drawGhost(ctx, x, y, t) {
+    var bob = Math.sin(t * 3) * 4;
+    var yy = y + bob;
+    ctx.fillStyle = "#ffffff";
+    // body: dome + skirt
+    ctx.beginPath();
+    ctx.arc(x, yy, 46, Math.PI, 0);
+    ctx.lineTo(x + 46, yy + 52);
+    ctx.lineTo(x + 23, yy + 38);
+    ctx.lineTo(x, yy + 52);
+    ctx.lineTo(x - 23, yy + 38);
+    ctx.lineTo(x - 46, yy + 52);
+    ctx.lineTo(x - 46, yy);
+    ctx.closePath();
+    ctx.fill();
+    // eyes
+    ctx.fillStyle = "#14101d";
+    ctx.beginPath(); ctx.arc(x - 17, yy - 6, 7, 0, 6.283); ctx.fill();
+    ctx.beginPath(); ctx.arc(x + 17, yy - 6, 7, 0, 6.283); ctx.fill();
+    // cheeks
+    ctx.fillStyle = "#ffb3d9";
+    ctx.beginPath(); ctx.arc(x - 30, yy + 12, 6, 0, 6.283); ctx.fill();
+    ctx.beginPath(); ctx.arc(x + 30, yy + 12, 6, 0, 6.283); ctx.fill();
+  }
+
+  function draw(ctx) {
+    // sky
+    ctx.fillStyle = "#14101d";
+    ctx.fillRect(0, 0, W, H);
+    // twinkling dots
+    ctx.fillStyle = "#3d3557";
+    for (var i = 0; i < dots.length; i++) {
+      var d = dots[i];
+      var r = d.r * (0.6 + 0.4 * Math.sin(state.elapsed * d.sp + d.ph));
+      ctx.beginPath(); ctx.arc(d.x, d.y, Math.max(0.4, r), 0, 6.283); ctx.fill();
+    }
+    // floor
+    ctx.fillStyle = "#241d38";
+    ctx.fillRect(0, H - 24, W, 24);
+    ctx.fillStyle = "#e6007e";
+    ctx.fillRect(0, H - 24, W, 4);
+
+    // stars
+    for (var i = 0; i < state.stars.length; i++) {
+      var s = state.stars[i];
+      ctx.fillStyle = "#ffd23e";
+      starPath(ctx, s.x, s.y, s.r, s.rot);
+      ctx.fill();
+      ctx.fillStyle = "#fff3c4";
+      starPath(ctx, s.x, s.y, s.r * 0.45, s.rot);
+      ctx.fill();
+    }
+    // catch particles
+    ctx.fillStyle = "#ffd23e";
+    for (var p = 0; p < state.particles.length; p++) {
+      var pt = state.particles[p];
+      var pr = Math.max(0.5, pt.r * (1 - pt.age / 0.35));
+      ctx.beginPath(); ctx.arc(pt.x, pt.y, pr, 0, 6.283); ctx.fill();
+    }
+    // score popups
+    ctx.fillStyle = "#7dff9b";
+    ctx.font = "bold 26px monospace";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    for (var q = 0; q < state.popups.length; q++) {
+      var pp = state.popups[q];
+      ctx.fillText(pp.text, pp.x, pp.y);
+    }
+
+    drawGhost(ctx, state.ghostX, GHOST_Y, state.elapsed);
+
+    // HUD: score, lives, timer
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 34px monospace";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
+    ctx.fillText("SCORE " + state.score, 28, 52);
+    ctx.textAlign = "right";
+    var hearts = "";
+    for (var h = 0; h < MAX_LIVES; h++) hearts += (h < state.lives) ? "♥" : "♡";
+    ctx.fillStyle = "#ff5c8a";
+    ctx.fillText(hearts, W - 28, 52);
+    // timer bar
+    var barW = 320, barX = (W - barW) / 2;
+    ctx.fillStyle = "#241d38";
+    ctx.fillRect(barX, 30, barW, 16);
+    ctx.fillStyle = state.timeLeft <= 10 ? "#ff5c5c" : "#e6007e";
+    ctx.fillRect(barX, 30, barW * (state.timeLeft / ROUND_SECONDS), 16);
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 24px monospace";
+    ctx.textAlign = "center";
+    ctx.fillText(Math.ceil(state.timeLeft) + "s", W / 2, 84);
+
+    if (state.over) {
+      ctx.fillStyle = "#14101d";
+      ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 72px monospace";
+      ctx.textAlign = "center";
+      ctx.fillText(state.won ? "TIME UP!" : "GAME OVER", W / 2, H / 2 - 60);
+      ctx.fillStyle = "#ffd23e";
+      ctx.font = "bold 44px monospace";
+      ctx.fillText("Score: " + state.score, W / 2, H / 2 + 20);
+      ctx.fillStyle = "#8a84a3";
+      ctx.font = "bold 26px monospace";
+      ctx.fillText("Caught " + state.caught + " stars · " + state.missed + " slipped away",
+                   W / 2, H / 2 + 80);
+      ctx.fillStyle = "#ffffff";
+      ctx.fillText("Press R to play again", W / 2, H / 2 + 150);
+    }
+  }
+
+  // --- input ---------------------------------------------------------------
+  var keys = {};
+  function onKey(e) {
+    if (e.key === "ArrowLeft" || e.key === "a" || e.key === "A") {
+      state.dir = (e.type === "keydown") ? -1 : (keys.right ? 1 : 0);
+      keys.left = e.type === "keydown";
+    }
+    if (e.key === "ArrowRight" || e.key === "d" || e.key === "D") {
+      state.dir = (e.type === "keydown") ? 1 : (keys.left ? -1 : 0);
+      keys.right = e.type === "keydown";
+    }
+    if ((e.key === "r" || e.key === "R") && e.type === "keydown" && state.over) {
+      state = freshState();
+    }
+    if (e.key === " " || e.key.indexOf("Arrow") === 0) e.preventDefault();
+  }
+
+  // --- wiring --------------------------------------------------------------
+  var canvas = null, ctx = null;
+  if (typeof document !== "undefined") {
+    canvas = document.getElementById("game");
+    ctx = canvas.getContext("2d");
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("keyup", onKey);
+    canvas.addEventListener("pointermove", function (e) {
+      var r = canvas.getBoundingClientRect();
+      state.pointerX = (e.clientX - r.left) * (W / r.width);
+    });
+    canvas.addEventListener("pointerdown", function (e) {
+      var r = canvas.getBoundingClientRect();
+      state.pointerX = (e.clientX - r.left) * (W / r.width);
+      if (state.over) state = freshState();
+    });
+  }
+
+  // Headless handle: the video renderer drives the same code step by step.
+  var api = {
+    W: W, H: H, state: function () { return state; },
+    reset: function () { state = freshState(); },
+    setDir: function (d) { state.dir = d; },
+    setPointer: function (x) { state.pointerX = x; },
+    step: function (dt) { update(dt); },
+    draw: function (c) { draw(c); },
+  };
+  if (typeof window !== "undefined") window.__game = api;
+  if (typeof module !== "undefined") module.exports = api;
+
+  // Browser loop (skipped when a headless runner drives step() itself).
+  if (typeof window !== "undefined" && !window.__HEADLESS__ && ctx) {
+    var last = 0;
+    function frame(ts) {
+      var dt = Math.min(0.05, (ts - last) / 1000 || 0.016);
+      last = ts;
+      update(dt);
+      draw(ctx);
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>
